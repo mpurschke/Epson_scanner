@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Scan mounted 35 mm slides in the Epson Perfection V350 (GT-F720) 1x4 holder.
+
+  scanslides [options] name      -> name_1.tif ... name_4.tif (one per slide found)
+
+Each run makes a 300 dpi overview of the transparency strip, finds which of the
+four holder windows hold a slide and where the image opening of each mount is,
+then scans just that opening at high resolution (the mount is left out).
+
+Options:
+  -r DPI       resolution: 600|1200|2400|4800 (default 2400)
+  -d 16        16 bits per channel (default 8)
+  -j           JPEG instead of TIFF (8 bit only)
+  -s 1,3       only these slots (default: all slots that hold a slide)
+  -R DEG       rotate the result by 90, 180 or 270 degrees (clockwise)
+  -M           mirror (slide inserted with the emulsion facing up)
+  -m MM        extra margin to cut off inside the mount opening (default 0.3)
+  -k           keep the overview scan as name_overview.png
+  -D DEV       SANE device (default: first scanner found)
+
+Holder geometry (calibrated 2026-10-07 from an empty-holder scan at 300 dpi):
+four windows, each 51 mm long, starting 11.35 / 69.26 / 127.08 / 184.91 mm
+down the 33 mm wide transparency strip.
+"""
+import argparse, os, subprocess, sys, tempfile
+import numpy as np
+from PIL import Image
+
+SLOTS_T = [11.35, 69.26, 127.08, 184.91]   # mm, top of each holder window
+SLOT_LEN = 51.0                             # mm, along the strip
+STRIP_W = 33.02                             # mm, across the strip
+PREVIEW_DPI = 300
+IMG_LONG, IMG_SHORT = 36.0, 24.0            # nominal slide image, mm
+
+def mm2px(v, dpi): return v / 25.4 * dpi
+def px2mm(v, dpi): return v * 25.4 / dpi
+
+def scan(dev, out, dpi, l, t, x, y, depth=8, fmt="png"):
+    cmd = ["scanimage", "-d", dev, "--source", "Transparency Unit",
+           "--film-type", "Positive Film", "--mode", "Color",
+           "--depth", str(depth), "--resolution", str(dpi),
+           "-l", f"{l:.2f}", "-t", f"{t:.2f}", "-x", f"{x:.2f}", "-y", f"{y:.2f}",
+           f"--format={fmt}", "-o", out]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"scanimage failed: {r.stderr.strip()}\n"
+                 "(if the scanner light blinks red: power-cycle it and try again)")
+
+def runs(mask, minlen):
+    """longest run of True in a 1-D mask (start, end inclusive), or None"""
+    best, s = None, None
+    for i, v in enumerate(list(mask) + [False]):
+        if v and s is None: s = i
+        if not v and s is not None:
+            if i - s >= minlen and (best is None or i - s > best[1] - best[0] + 1):
+                best = (s, i - 1)
+            s = None
+    return best
+
+def find_opening(a, slot):
+    """a: overview luminance (rows along strip). Returns (status, (t,l,y,x) mm)."""
+    r0 = int(round(mm2px(SLOTS_T[slot], PREVIEW_DPI)))
+    r1 = int(round(mm2px(SLOTS_T[slot] + SLOT_LEN, PREVIEW_DPI)))
+    w = a[r0:r1, :]
+    if w.mean() > 225 and w.std() < 15:
+        return "empty", None
+    black = np.percentile(w, 2)
+    m = w > black + 20                       # anything that transmits more than the mount
+    rows = runs(m.mean(axis=1) > 0.5, mm2px(10, PREVIEW_DPI))
+    cols = runs(m.mean(axis=0) > 0.5, mm2px(10, PREVIEW_DPI))
+    if rows and cols:
+        t = SLOTS_T[slot] + px2mm(rows[0], PREVIEW_DPI)
+        y = px2mm(rows[1] - rows[0] + 1, PREVIEW_DPI)
+        l = px2mm(cols[0], PREVIEW_DPI)
+        x = px2mm(cols[1] - cols[0] + 1, PREVIEW_DPI)
+        if 25 <= y <= 40 and 18 <= x <= 30:
+            return "found", (t, l, y, x)
+    # dark slide or unusual mount: nominal 36 x 24 mm opening, centred in the window
+    t = SLOTS_T[slot] + (SLOT_LEN - IMG_LONG) / 2
+    l = (STRIP_W - IMG_SHORT) / 2
+    return "nominal", (t, l, IMG_LONG, IMG_SHORT)
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0], add_help=False)
+    p.add_argument("name"); p.add_argument("-r", type=int, default=2400)
+    p.add_argument("-d", type=int, default=8, choices=[8, 16])
+    p.add_argument("-j", action="store_true"); p.add_argument("-s", default="")
+    p.add_argument("-R", type=int, default=0, choices=[0, 90, 180, 270])
+    p.add_argument("-M", action="store_true"); p.add_argument("-m", type=float, default=0.3)
+    p.add_argument("-k", action="store_true"); p.add_argument("-D", default="")
+    p.add_argument("-h", action="store_true")
+    if "-h" in sys.argv[1:] or len(sys.argv) == 1:
+        print(__doc__); sys.exit(0)
+    o = p.parse_args()
+    if o.j and o.d == 16: sys.exit("-j (JPEG) is 8 bit only")
+
+    dev = o.D or os.environ.get("SANE_DEFAULT_DEVICE") or subprocess.run(
+        ["scanimage", "-f", "%d%n"], capture_output=True, text=True).stdout.split("\n")[0]
+    if not dev: sys.exit("no scanner found (is iscan still open?)")
+
+    tmp = tempfile.mkdtemp()
+    ov = os.path.join(tmp, "overview.png")
+    print("overview scan ...", flush=True)
+    scan(dev, ov, PREVIEW_DPI, 0, 0, STRIP_W, SLOTS_T[-1] + SLOT_LEN + 2)
+    a = np.asarray(Image.open(ov).convert("L"), dtype=float)
+    if o.k: os.replace(ov, f"{o.name}_overview.png")
+
+    want = [int(s) - 1 for s in o.s.split(",") if s] or range(4)
+    for slot in want:
+        status, box = find_opening(a, slot)
+        if status == "empty":
+            print(f"slot {slot+1}: empty"); continue
+        t, l, y, x = box
+        t, l, y, x = t + o.m, l + o.m, y - 2 * o.m, x - 2 * o.m
+        note = "" if status == "found" else "  (opening not detected: dark slide? using nominal 36x24 mm)"
+        print(f"slot {slot+1}: {y:.1f} x {x:.1f} mm at {o.r} dpi ...{note}", flush=True)
+        ext = "jpg" if o.j else "tif"
+        out = f"{o.name}_{slot+1}.{ext}"
+        raw = os.path.join(tmp, f"s{slot}.tif")
+        scan(dev, raw, o.r, l, t, x, y, depth=o.d, fmt="tiff")
+        conv = ["convert", raw]
+        if o.M: conv += ["-flop"]
+        if o.R: conv += ["-rotate", str(o.R)]
+        conv += ["-density", str(o.r), "-units", "PixelsPerInch"]
+        if o.j: conv += ["-quality", "92"]
+        else: conv += ["-compress", "lzw"]
+        subprocess.run(conv + [out], check=True)
+        os.remove(raw)
+        print(f"  -> {out}")
+    os.rmdir(tmp) if not os.listdir(tmp) else None
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,74 @@
+#!/bin/bash
+# Scan a series of pages on the flatbed into one searchable PDF.
+#
+#   scanpages [options] name        -> name.pdf, page images in name_pages/
+#
+# Before each page it waits for Enter; Ctrl-D ends the series.
+#
+# Options:
+#   -r dpi    resolution, 100|200|300|600|1200 (default 300)
+#   -c        color (default: gray)
+#   -a area   Letter|A4|Maximum (default Letter)
+#   -L lang   OCR language(s) for tesseract, e.g. eng or eng+deu (default eng)
+#   -n        no OCR: image-only PDF
+#   -s        skip scanning: build the PDF from the existing name_pages/*.png
+#             (e.g. after rescanning a single page with -b N)
+#   -b N      scan only page N (replaces name_pages/pageNN.png), no PDF
+#   -d dev    SANE device (default: $SANE_DEFAULT_DEVICE or the first scanner)
+set -euo pipefail
+
+dpi=300 mode=Gray area=Letter lang=eng ocr=1 scan=1 single= dev=${SANE_DEFAULT_DEVICE:-}
+while getopts "r:ca:L:nsb:d:h" o; do
+  case $o in
+    r) dpi=$OPTARG ;;   c) mode=Color ;;   a) area=$OPTARG ;;
+    L) lang=$OPTARG ;;  n) ocr=0 ;;        s) scan=0 ;;
+    b) single=$OPTARG ;; d) dev=$OPTARG ;;
+    *) sed -n '2,/^set -e/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 1 ;;
+  esac
+done
+shift $((OPTIND-1))
+[ $# -eq 1 ] || { echo "usage: scanpages [options] name   (-h for help)" >&2; exit 1; }
+name=${1%.pdf}
+dir=${name}_pages
+mkdir -p "$dir"
+
+[ -n "$dev" ] || dev=$(scanimage -f '%d%n' 2>/dev/null | head -1)
+[ -n "$dev" ] || { echo "no scanner found (is iscan still open?)" >&2; exit 1; }
+cmd=(scanimage -d "$dev" --mode "$mode" --resolution "$dpi" --scan-area "$area" --format=png)
+
+if [ -n "$single" ]; then
+  f=$(printf "%s/page%02d.png" "$dir" "$single")
+  echo "scanning $f ..."
+  "${cmd[@]}" -o "$f"
+  echo "done; rebuild the PDF with: scanpages -s ${name}"
+  exit 0
+fi
+
+if [ $scan -eq 1 ]; then
+  shopt -s nullglob; have=("$dir"/page*.png); shopt -u nullglob
+  start=$(( ${#have[@]} + 1 ))
+  if [ $start -gt 1 ]; then echo "$dir already has ${#have[@]} page(s); continuing with page $start"; fi
+  "${cmd[@]}" --batch="$dir/page%02d.png" --batch-start=$start --batch-prompt || true
+fi
+
+pages=("$dir"/page*.png)
+[ -e "${pages[0]}" ] || { echo "no pages in $dir" >&2; exit 1; }
+echo "${#pages[@]} page(s) -> ${name}.pdf"
+
+# PNG (lossless, kept) -> JPEG for a compact PDF; img2pdf embeds JPEGs as they are
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+for p in "${pages[@]}"; do
+  # scanimage stores the resolution in the PNG; use -r only for files without one
+  dens=()
+  [ "$(identify -format '%U' "$p")" = Undefined ] && dens=(-density "$dpi")
+  convert "$p" "${dens[@]}" -units PixelsPerInch -quality 85 "$tmp/$(basename "${p%.png}").jpg"
+done
+python3 -c 'import sys, img2pdf; open(sys.argv[1], "wb").write(img2pdf.convert(sorted(sys.argv[2:])))' \
+  "$tmp/raw.pdf" "$tmp"/page*.jpg
+
+if [ $ocr -eq 1 ]; then
+  ocrmypdf -q -l "$lang" --rotate-pages --deskew --optimize 1 "$tmp/raw.pdf" "${name}.pdf"
+else
+  cp "$tmp/raw.pdf" "${name}.pdf"
+fi
+echo "wrote ${name}.pdf ($(du -h "${name}.pdf" | cut -f1))"
