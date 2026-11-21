@@ -32,7 +32,7 @@ name=${1%.pdf}
 dir=${name}_pages
 mkdir -p "$dir"
 
-[ -n "$dev" ] || dev=$(scanimage -f '%d%n' 2>/dev/null | head -1)
+[ -n "$dev" ] || dev=$(scanimage -f '%d%n' 2>/dev/null | grep -v '^v4l:' | head -1)  # skip webcams
 [ -n "$dev" ] || { echo "no scanner found (is iscan still open?)" >&2; exit 1; }
 cmd=(scanimage -d "$dev" --mode "$mode" --resolution "$dpi" --scan-area "$area" --format=png)
 

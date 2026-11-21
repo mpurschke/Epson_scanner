@@ -94,8 +94,10 @@ def main():
     o = p.parse_args()
     if o.j and o.d == 16: sys.exit("-j (JPEG) is 8 bit only")
 
-    dev = o.D or os.environ.get("SANE_DEFAULT_DEVICE") or subprocess.run(
-        ["scanimage", "-f", "%d%n"], capture_output=True, text=True).stdout.split("\n")[0]
+    devs = subprocess.run(["scanimage", "-f", "%d%n"], capture_output=True,
+                          text=True).stdout.split()
+    dev = o.D or os.environ.get("SANE_DEFAULT_DEVICE") or next(
+        (d for d in devs if not d.startswith("v4l:")), "")  # skip webcams
     if not dev: sys.exit("no scanner found (is iscan still open?)")
 
     tmp = tempfile.mkdtemp()
